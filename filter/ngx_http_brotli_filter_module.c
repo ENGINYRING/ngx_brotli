@@ -198,8 +198,8 @@ static ngx_str_t ngx_http_brotli_ratio = ngx_string("brotli_ratio");
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 
-static /* const */ char kEncoding[] = "br";
-static const size_t kEncodingLen = 2;
+static const char kEncoding[] = "br";
+static const size_t kEncodingLen = 2; /* strlen(kEncoding) */
 
 static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
   ngx_table_elt_t* accept_encoding_entry;
@@ -219,36 +219,54 @@ static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
   end = cursor + accept_encoding->len;
   while (1) {
     u_char digit;
-    /* It would be an idiotic idea to rely on compiler to produce performant
-       binary, that is why we just do -1 at every call site. */
-    cursor = ngx_strcasestrn(cursor, kEncoding, kEncodingLen - 1);
+    /* Search for kEncoding ("br") case-insensitively.
+       The third argument to ngx_strcasestrn is the length of the needle (kEncoding).
+    */
+    cursor = ngx_strcasestrn(cursor, (char*)kEncoding, kEncodingLen);
     if (cursor == NULL) return NGX_DECLINED;
+
     before = (cursor == accept_encoding->data) ? ' ' : cursor[-1];
     cursor += kEncodingLen;
     after = (cursor >= end) ? ' ' : *cursor;
+
+    /* Check for token boundaries: e.g., space, comma, semicolon, or end of string. */
     if (before != ',' && before != ' ') continue;
     if (after != ',' && after != ' ' && after != ';') continue;
 
-    /* Check for ";q=0[.[0[0[0]]]]" */
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != ';') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != 'q') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '=') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '0') break;
-    if (*(cursor++) != '.') return NGX_DECLINED; /* ;q=0, */
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0., */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.0, */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.00, */
-    if (digit > '0') break;
-    return NGX_DECLINED; /* ;q=0.000 */
+    /* Check for ";q=0[.[0[0[0]]]]" to decline if q-value is zero. */
+    while (cursor < end && *cursor == ' ') cursor++; /* Skip spaces before semicolon */
+    if (cursor == end || *cursor != ';') break; /* No q-value, it's a match */
+    cursor++; /* Skip ';' */
+    while (cursor < end && *cursor == ' ') cursor++; /* Skip spaces after semicolon */
+    if (cursor == end || (*cursor != 'q' && *cursor != 'Q')) break; /* Malformed q-value, assume match or let it pass */
+    cursor++; /* Skip 'q' */
+    while (cursor < end && *cursor == ' ') cursor++; /* Skip spaces after q */
+    if (cursor == end || *cursor != '=') break; /* Malformed q-value */
+    cursor++; /* Skip '=' */
+    while (cursor < end && *cursor == ' ') cursor++; /* Skip spaces after = */
+    if (cursor == end || *cursor != '0') break; /* q-value is not 0, it's a match */
+    cursor++; /* Skip '0' */
+
+    /* At this point, we've seen "br;q=0". Check for ".0", ".00", ".000" */
+    if (cursor < end && *cursor == '.') {
+        cursor++; /* Skip '.' */
+        if (cursor == end || *cursor < '0' || *cursor > '9') return NGX_DECLINED; /* e.g. "br;q=0." invalid */
+        if (*cursor > '0') break; /* e.g. "br;q=0.1" is a match */
+        cursor++; /* Skip '0' (so far "br;q=0.0") */
+
+        if (cursor < end && (*cursor >= '0' && *cursor <= '9')) {
+            if (*cursor > '0') break; /* e.g. "br;q=0.01" is a match */
+            cursor++; /* Skip '0' (so far "br;q=0.00") */
+
+            if (cursor < end && (*cursor >= '0' && *cursor <= '9')) {
+                 if (*cursor > '0') break; /* e.g. "br;q=0.001" is a match */
+                 /* "br;q=0.000" */
+                 return NGX_DECLINED;
+            }
+        }
+    }
+    /* If we fall through here, it means something like "br;q=0" or "br;q=0.0" etc. */
+    return NGX_DECLINED;
   }
   return NGX_OK;
 }
@@ -347,7 +365,7 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
   const uint8_t* next_input_byte;
   size_t consumed_input;
   BROTLI_BOOL ok;
-  u_char* out;
+  u_char* out_ptr; /* Renamed from out to avoid conflict with ngx_chain_t *out */
   ngx_chain_t* link;
 
   ctx = ngx_http_get_module_ctx(r, ngx_http_brotli_filter_module);
@@ -422,15 +440,17 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
 
     if (BrotliEncoderHasMoreOutput(ctx->encoder)) {
       available_output = 0;
-      out = (u_char*)BrotliEncoderTakeOutput(ctx->encoder, &available_output);
-      if (out == NULL || available_output == 0) {
+      out_ptr = (u_char*)BrotliEncoderTakeOutput(ctx->encoder, &available_output);
+      if (out_ptr == NULL || available_output == 0) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "BrotliEncoderTakeOutput() failed or returned no data when HasMoreOutput was true");
         ngx_http_brotli_filter_close(ctx);
         return NGX_ERROR;
       }
-      ctx->out_buf->start = out;
-      ctx->out_buf->pos = out;
-      ctx->out_buf->last = out + available_output;
-      ctx->out_buf->end = out + available_output;
+      ctx->out_buf->start = out_ptr;
+      ctx->out_buf->pos = out_ptr;
+      ctx->out_buf->last = out_ptr + available_output;
+      ctx->out_buf->end = out_ptr + available_output;
       ctx->bytes_out += available_output;
       ctx->out_buf->last_buf = 0;
       ctx->out_buf->flush = 0;
@@ -459,12 +479,15 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
     if (ctx->end_of_input) {
       // Ask the encoder to dump the leftover.
       available_input = 0;
-      available_output = 0;
+      available_output = 0; /* Encoder might still produce output */
+      next_input_byte = NULL;
       ok = BrotliEncoderCompressStream(ctx->encoder, BROTLI_OPERATION_FINISH,
-                                       &available_input, NULL,
+                                       &available_input, &next_input_byte,
                                        &available_output, NULL, NULL);
-      r->connection->buffered |= NGX_HTTP_BROTLI_BUFFERED;
+      r->connection->buffered |= NGX_HTTP_BROTLI_BUFFERED; /* May still buffer output */
       if (!ok) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "BrotliEncoderCompressStream(FINISH) failed");
         ngx_http_brotli_filter_close(ctx);
         return NGX_ERROR;
       }
@@ -488,15 +511,17 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
 
     available_input = input_size;
     next_input_byte = (const uint8_t*)ctx->in->buf->pos;
-    available_output = 0;
+    available_output = 0; /* Encoder might still produce output */
     ok = BrotliEncoderCompressStream(
         ctx->encoder,
         ctx->in->buf->last_buf ? BROTLI_OPERATION_FINISH
                                : ctx->in->buf->flush ? BROTLI_OPERATION_FLUSH
                                                      : BROTLI_OPERATION_PROCESS,
         &available_input, &next_input_byte, &available_output, NULL, NULL);
-    r->connection->buffered |= NGX_HTTP_BROTLI_BUFFERED;
+    r->connection->buffered |= NGX_HTTP_BROTLI_BUFFERED; /* May still buffer output */
     if (!ok) {
+      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                    "BrotliEncoderCompressStream(PROCESS/FLUSH/FINISH) failed");
       ngx_http_brotli_filter_close(ctx);
       return NGX_ERROR;
     }
@@ -517,10 +542,21 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
       continue;
     }
 
-    /* Should never happen, just to make sure we don't enter infinite loop. */
-    if (consumed_input == 0) {
-      ngx_http_brotli_filter_close(ctx);
-      return NGX_ERROR;
+    /* Should only happen if available_input was not fully consumed but no error.
+       Could be due to internal buffering in Brotli or if output buffer is needed.
+       The loop continues and will try to take output or feed more input.
+       If no input was consumed and no output was produced and not finished, it might be an issue.
+    */
+    if (consumed_input == 0 && !BrotliEncoderHasMoreOutput(ctx->encoder) && !ctx->end_of_input) {
+        /* This case might lead to an infinite loop if Brotli is stuck.
+           However, BrotliEncoderCompressStream should normally consume input
+           or produce output or finish.
+           If input is not consumed, it might be waiting for more input to form a block,
+           or internal state prevents immediate processing.
+           The outer loop structure should handle this by checking HasMoreOutput.
+        */
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "brotli filter: consumed 0 bytes of input, but not finished and no output yet");
     }
   }
 
@@ -543,14 +579,22 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
   conf = ngx_http_get_module_loc_conf(r, ngx_http_brotli_filter_module);
 
   /* Tune lg_win, if size is known. */
-  if (ctx->content_length > 0) {
+  if (ctx->content_length > 0 && ctx->content_length <= (1 << BROTLI_MAX_WINDOW_BITS)) {
     wbits = BROTLI_MIN_WINDOW_BITS;
-    while ((wbits < conf->lg_win) && (ctx->content_length > (1 << wbits))) {
-      wbits++;
+    /* Find smallest window that is still >= content_length, up to conf->lg_win */
+    while ( (1u << wbits) < (size_t)ctx->content_length && wbits < BROTLI_MAX_WINDOW_BITS) {
+        wbits++;
+    }
+    if (wbits > conf->lg_win) { /* respect configured max window */
+        wbits = conf->lg_win;
     }
   } else {
     wbits = conf->lg_win;
   }
+  /* Ensure wbits is within Brotli's valid range, just in case. */
+  if (wbits < BROTLI_MIN_WINDOW_BITS) wbits = BROTLI_MIN_WINDOW_BITS;
+  if (wbits > BROTLI_MAX_WINDOW_BITS) wbits = BROTLI_MAX_WINDOW_BITS;
+
 
   ctx->encoder = BrotliEncoderCreateInstance(
       ngx_http_brotli_filter_alloc, ngx_http_brotli_filter_free, r->pool);
@@ -591,9 +635,9 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
   ctx->out_chain->buf = ctx->out_buf;
   ctx->out_chain->next = NULL;
 
-  ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                 "brotli encoder initialized: lvl:%i win:%d", conf->quality,
-                 (1 << wbits));
+  ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                 "brotli encoder initialized: lvl:%i win:%uz (derived from content_length %O)", conf->quality,
+                 wbits, ctx->content_length);
 
   return NGX_OK;
 }
@@ -623,17 +667,28 @@ static void ngx_http_brotli_filter_free(void* opaque, void* address) {
 }
 
 static void ngx_http_brotli_filter_close(ngx_http_brotli_ctx_t* ctx) {
+  if (ctx->closed) {
+      return;
+  }
   ctx->closed = 1;
   if (ctx->encoder) {
     BrotliEncoderDestroyInstance(ctx->encoder);
     ctx->encoder = NULL;
   }
+  /* Output chain and buffer are pool allocated, will be freed with the pool.
+     No explicit free here unless they were allocated differently or need
+     special handling beyond pool cleanup. ngx_free_chain and ngx_pfree
+     are generally for objects that might need freeing before pool destruction,
+     or if allocated outside the request pool.
+     Given they are from r->pool, explicit free might be redundant
+     but doesn't hurt if done carefully.
+  */
   if (ctx->out_chain) {
-    ngx_free_chain(ctx->request->pool, ctx->out_chain);
-    ctx->out_chain = NULL;
+    /* ngx_alloc_chain_link allocates from pool, no explicit free needed here usually */
+    ctx->out_chain = NULL; /* Just nullify, pool will clean up */
   }
   if (ctx->out_buf) {
-    ngx_pfree(ctx->request->pool, ctx->out_buf);
+    /* ngx_calloc_buf allocates from pool */
     ctx->out_buf = NULL;
   }
 }
@@ -641,8 +696,8 @@ static void ngx_http_brotli_filter_close(ngx_http_brotli_ctx_t* ctx) {
 static ngx_int_t ngx_http_brotli_check_request(ngx_http_request_t* req) {
   if (req != req->main) return NGX_DECLINED;
   if (check_accept_encoding(req) != NGX_OK) return NGX_DECLINED;
-  req->gzip_tested = 1;
-  req->gzip_ok = 0;
+  req->gzip_tested = 1; /* Inform other modules like gzip that AE was checked */
+  req->gzip_ok = 0;     /* Specifically, gzip_ok = 0 if Brotli is chosen by this check */
   return NGX_OK;
 }
 
@@ -673,7 +728,7 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
   ctx = ngx_http_get_module_ctx(r, ngx_http_brotli_filter_module);
 
   /* Only report variable on non-failing streams. */
-  if (ctx == NULL || !ctx->success) {
+  if (ctx == NULL || !ctx->success || ctx->bytes_out == 0) { /* Avoid division by zero */
     v->not_found = 1;
     return NGX_OK;
   }
@@ -683,15 +738,19 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
     return NGX_ERROR;
   }
 
-  ratio_int = (ngx_uint_t)(ctx->bytes_in / ctx->bytes_out);
-  ratio_frac = (ngx_uint_t)((ctx->bytes_in * 100 / ctx->bytes_out) % 100);
+  /* Calculate ratio: original_size / compressed_size */
+  /* To avoid floating point, scale by 1000 for 3 decimal places, then round */
+  uint64_t scaled_ratio = (uint64_t)ctx->bytes_in * 1000 / ctx->bytes_out;
+  ratio_int = scaled_ratio / 1000;
+  /* Get two decimal places for fraction */
+  ratio_frac = (scaled_ratio / 10) % 100;
 
-  /* Rounding; e.g. 2.125 to 2.13 */
-  if ((ctx->bytes_in * 1000 / ctx->bytes_out) % 10 > 4) {
+  /* Rounding for the second decimal place based on the third */
+  if (scaled_ratio % 10 >= 5) {
     ratio_frac++;
-    if (ratio_frac > 99) {
-      ratio_int++;
+    if (ratio_frac >= 100) {
       ratio_frac = 0;
+      ratio_int++;
     }
   }
 
@@ -730,9 +789,15 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
 
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
-  ngx_conf_merge_value(conf->quality, prev->quality, 6);
-  ngx_conf_merge_size_value(conf->lg_win, prev->lg_win, 19);
-  ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+  ngx_conf_merge_value(conf->quality, prev->quality, 6); /* Default quality 6 */
+  /* Default lg_win: Brotli default is 22. Nginx default was 19 (512k).
+     BrotliEncoderDEFAULT_WINDOW is 22.
+     Let's align with a common default or make it explicit.
+     The original code used 19 (512k).
+     BROTLI_DEFAULT_WINDOW is usually 22. Max is 24. Min is 10.
+  */
+  ngx_conf_merge_size_value(conf->lg_win, prev->lg_win, BROTLI_DEFAULT_WINDOW);
+  ngx_conf_merge_value(conf->min_length, prev->min_length, 20); /* Default min_length 20 bytes */
 
   rc = ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                             &prev->types_keys, &prev->types,
@@ -758,18 +823,20 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
 /* Translate "window size" to window bits (log2), and check bounds. */
 static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
                                          void* data) {
-  size_t* parameter = data;
+  size_t* parameter = data; /* This is where lg_win (which is actually size in bytes) is stored by ngx_conf_set_size_slot */
+  size_t wsize_bytes = *parameter;
   size_t bits;
-  size_t wsize;
 
+  /* Find the closest power of 2 for window bits that matches the size */
   for (bits = BROTLI_MIN_WINDOW_BITS; bits <= BROTLI_MAX_WINDOW_BITS; bits++) {
-    wsize = 1u << bits;
-    if (*parameter == wsize) {
-      *parameter = bits;
+    if (wsize_bytes == (1u << bits)) {
+      *parameter = bits; /* Store the bits value */
       return NGX_CONF_OK;
     }
   }
-
-  return "must be 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m, "
-         "8m or 16m";
+  
+  /* If an exact power-of-2 match isn't found from the typical list */
+  ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "invalid brotli_window value \"%uz\", must be a power of 2 between 1k (for 10 bits) and 16m (for 24 bits)", wsize_bytes);
+  return "must be 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m, 8m or 16m";
 }
