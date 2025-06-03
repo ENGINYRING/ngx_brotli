@@ -1,3 +1,5 @@
+# WORK IN PROGRESS! DO NOT USE IN PRODUCTION
+
 # ngx_brotli
 
 Brotli is a generic-purpose lossless compression algorithm that compresses data
